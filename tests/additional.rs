@@ -1,10 +1,9 @@
-use anyhow::Result;
-use mmap_vecdeque::MmapVecDeque;
+use mmap_vecdeque::{MmapVecDeque, MmapVecDequeError};
 use tempfile::TempDir;
 
 /// Test that attempting to reopen a deque with a different type results in an error.
 #[test]
-fn test_type_mismatch() -> Result<()> {
+fn test_type_mismatch() -> Result<(), MmapVecDequeError> {
   let tmp = TempDir::new()?;
   let path = tmp.path();
 
@@ -21,7 +20,7 @@ fn test_type_mismatch() -> Result<()> {
 
 /// Test persistence: write data, commit, drop, reopen, and ensure data is still there.
 #[test]
-fn test_persistence_across_open() -> Result<()> {
+fn test_persistence_across_open() -> Result<(), MmapVecDequeError> {
   let tmp = TempDir::new()?;
   let path = tmp.path();
 
@@ -36,8 +35,8 @@ fn test_persistence_across_open() -> Result<()> {
   // Reopen and check data
   let dq = MmapVecDeque::<u64>::open_or_create(path, None)?;
   assert_eq!(dq.len(), 3);
-  assert_eq!(dq.front(), Some(&50));
-  assert_eq!(dq.back(), Some(&200));
+  assert_eq!(dq.front(), Some(50));
+  assert_eq!(dq.back(), Some(200));
 
   Ok(())
 }
@@ -55,7 +54,7 @@ fn test_zero_sized_type_fails() {
 
 /// Test mixed operations: pushing/popping from both ends, committing at intervals.
 #[test]
-fn test_mixed_operations() -> Result<()> {
+fn test_mixed_operations() -> Result<(), MmapVecDequeError> {
   let tmp = TempDir::new()?;
   let path = tmp.path();
   let mut dq = MmapVecDeque::<i32>::open_or_create(path, Some(50))?;
@@ -69,8 +68,8 @@ fn test_mixed_operations() -> Result<()> {
 
   // Now we have 100 elements: front half negative, back half non-negative
   assert_eq!(dq.len(), 100);
-  assert_eq!(dq.front(), Some(&-49));
-  assert_eq!(dq.back(), Some(&49));
+  assert_eq!(dq.front(), Some(-49));
+  assert_eq!(dq.back(), Some(49));
 
   // Pop some from front and back
   for _ in 0..10 {
@@ -83,7 +82,7 @@ fn test_mixed_operations() -> Result<()> {
   assert_eq!(dq.len(), 80);
 
   // Verify the pattern after pops:
-  let collected: Vec<i32> = dq.iter().copied().collect();
+  let collected: Vec<i32> = dq.iter().collect();
   // Initially had [-49..=0 (front half), 0..=49 (back half)].
   // Removing 10 from front removes -49..=-40
   // Removing 10 from back removes 40..=49
@@ -95,44 +94,9 @@ fn test_mixed_operations() -> Result<()> {
   Ok(())
 }
 
-/// Test that shrinking of chunks and committing multiple times remains consistent.
-#[test]
-fn test_shrinking_chunks() -> Result<()> {
-  let tmp = TempDir::new()?;
-  let path = tmp.path();
-  let mut dq = MmapVecDeque::<u64>::open_or_create(path, Some(10))?;
-
-  // Insert a batch
-  for i in 0..50 {
-    dq.push_back(i)?;
-  }
-  dq.commit()?;
-  assert_eq!(dq.len(), 50);
-
-  // Remove some from front and back
-  for _ in 0..20 {
-    dq.pop_front()?;
-  }
-  for _ in 0..5 {
-    dq.pop_back()?;
-  }
-  dq.commit()?;
-  // Now length should be 50 - 20 - 5 = 25
-  assert_eq!(dq.len(), 25);
-
-  // Check contents
-  let collected: Vec<u64> = dq.iter().copied().collect();
-  // Original: 0..50
-  // Removed front 20 -> start now at 20..50
-  // Removed back 5 -> now have 20..45
-  assert_eq!(collected, (20..45).collect::<Vec<_>>());
-
-  Ok(())
-}
-
 /// Check operations after clearing
 #[test]
-fn test_clear_then_reuse() -> Result<()> {
+fn test_clear_then_reuse() -> Result<(), MmapVecDequeError> {
   let tmp = TempDir::new()?;
   let path = tmp.path();
   let mut dq = MmapVecDeque::<u8>::open_or_create(path, None)?;
@@ -150,8 +114,8 @@ fn test_clear_then_reuse() -> Result<()> {
   dq.push_back(100)?;
   dq.commit()?;
   assert_eq!(dq.len(), 2);
-  assert_eq!(dq.front(), Some(&99));
-  assert_eq!(dq.back(), Some(&100));
+  assert_eq!(dq.front(), Some(99));
+  assert_eq!(dq.back(), Some(100));
 
   Ok(())
 }

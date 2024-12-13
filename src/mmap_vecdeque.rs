@@ -1,10 +1,10 @@
-use anyhow::{bail, Context, Result};
+use crate::error::MmapVecDequeError;
 use parking_lot::Mutex;
 use serde::{Serialize, Deserialize};
 use std::fs::{self, OpenOptions, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::{ptr};
+use std::{ptr, mem::size_of};
 use memmap2::{MmapMut, MmapOptions};
 use std::marker::PhantomData;
 use atomicwrites::{AtomicFile, AllowOverwrite};
@@ -42,15 +42,15 @@ pub struct MmapVecDeque<T: Copy> {
 }
 
 impl<T: Copy> MmapVecDeque<T> {
-  pub fn open_or_create(dir: &Path, chunk_size: Option<usize>) -> Result<Self> {
+  pub fn open_or_create(dir: &Path, chunk_size: Option<usize>) -> Result<Self, MmapVecDequeError> {
     let chunk_size = chunk_size.unwrap_or(DEFAULT_CHUNK_SIZE);
     let element_size = size_of::<T>();
     if element_size == 0 {
-      bail!("Zero-sized types are not supported");
+      return Err(MmapVecDequeError::ZeroSizedType);
     }
 
     if !dir.exists() {
-      fs::create_dir_all(dir).context("creating directory for MmapVecDeque")?;
+      fs::create_dir_all(dir)?;
     }
 
     let metadata_file = dir.join("metadata.bin");
@@ -60,13 +60,22 @@ impl<T: Copy> MmapVecDeque<T> {
       let data = fs::read(&metadata_file)?;
       let meta: Metadata = postcard::from_bytes(&data)?;
       if meta.element_size != element_size {
-        bail!("Stored element size ({}) does not match requested element size ({})", meta.element_size, element_size);
+        return Err(MmapVecDequeError::ElementSizeMismatch {
+          stored: meta.element_size,
+          requested: element_size,
+        });
       }
       if meta.type_name != type_name {
-        bail!("Stored type ({}) does not match requested type ({})", meta.type_name, type_name);
+        return Err(MmapVecDequeError::TypeMismatch {
+          stored: meta.type_name.clone(),
+          requested: type_name.clone(),
+        });
       }
       if meta.chunk_size != chunk_size {
-        bail!("Stored chunk size ({}) does not match requested chunk size ({})", meta.chunk_size, chunk_size);
+        return Err(MmapVecDequeError::ChunkSizeMismatch {
+          stored: meta.chunk_size,
+          requested: chunk_size,
+        });
       }
       meta
     } else {
@@ -94,7 +103,7 @@ impl<T: Copy> MmapVecDeque<T> {
     Ok(deque)
   }
 
-  fn atomic_write_metadata(dir: &Path, meta: &Metadata) -> Result<()> {
+  fn atomic_write_metadata(dir: &Path, meta: &Metadata) -> Result<(), MmapVecDequeError> {
     let data = postcard::to_stdvec(meta)?;
     let af = AtomicFile::new(dir.join("metadata.bin"), AllowOverwrite);
     af.write(|f| {
@@ -105,7 +114,7 @@ impl<T: Copy> MmapVecDeque<T> {
     Ok(())
   }
 
-  fn load_chunks(&self) -> Result<()> {
+  fn load_chunks(&self) -> Result<(), MmapVecDequeError> {
     let meta = self.meta.lock();
     let start_chunk = meta.start / meta.chunk_size as u64;
     let end_chunk = if meta.start == meta.end {
@@ -136,7 +145,7 @@ impl<T: Copy> MmapVecDeque<T> {
     self.dir.join(format!("chunk_{}.bin", index))
   }
 
-  fn open_chunk(&self, index: u64, create: bool) -> Result<(MmapMut, File)> {
+  fn open_chunk(&self, index: u64, create: bool) -> Result<(MmapMut, File), MmapVecDequeError> {
     let meta = self.meta.lock();
     let chunk_byte_size = meta.chunk_size * meta.element_size;
     drop(meta);
@@ -156,7 +165,7 @@ impl<T: Copy> MmapVecDeque<T> {
     Ok((mmap, file))
   }
 
-  fn flush_all_chunks(&self) -> Result<()> {
+  fn flush_all_chunks(&self) -> Result<(), MmapVecDequeError> {
     let chunks = self.chunks.lock();
     for chunk in chunks.iter() {
       chunk.mmap.flush()?;
@@ -176,7 +185,7 @@ impl<T: Copy> MmapVecDeque<T> {
     (chunk_idx, elem_idx)
   }
 
-  fn ensure_capacity_for(&self, index: u64) -> Result<()> {
+  fn ensure_capacity_for(&self, index: u64) -> Result<(), MmapVecDequeError> {
     let meta = self.meta.lock();
     let chunk_size = meta.chunk_size as u64;
     let needed_chunk = index / chunk_size;
@@ -197,13 +206,13 @@ impl<T: Copy> MmapVecDeque<T> {
     let current_end_chunk = current_start_chunk + current_count - 1;
 
     if needed_chunk > current_end_chunk {
-      // add chunks at the end
-      for new_idx in (current_end_chunk+1)..=needed_chunk {
+      // Add chunks at the end
+      for new_idx in (current_end_chunk + 1)..=needed_chunk {
         let (mmap, file) = self.open_chunk(new_idx, true)?;
         chunks.push(Chunk { mmap, file });
       }
     } else if needed_chunk < current_start_chunk {
-      // add chunks at the front
+      // Add chunks at the front
       for new_idx in (needed_chunk..current_start_chunk).rev() {
         let (mmap, file) = self.open_chunk(new_idx, true)?;
         chunks.insert(0, Chunk { mmap, file });
@@ -216,7 +225,7 @@ impl<T: Copy> MmapVecDeque<T> {
     Ok(())
   }
 
-  fn write_element(&self, index: u64, value: T) -> Result<()> {
+  fn write_element(&self, index: u64, value: T) -> Result<(), MmapVecDequeError> {
     self.ensure_capacity_for(index)?;
     let (chunk_idx, elem_idx) = self.global_to_local(index);
     let chunks = self.chunks.lock();
@@ -225,7 +234,7 @@ impl<T: Copy> MmapVecDeque<T> {
     drop(meta);
 
     if chunk_idx >= chunks.len() {
-      bail!("Index out of range after ensuring capacity");
+      return Err(MmapVecDequeError::IndexOutOfRange);
     }
 
     let mmap = &chunks[chunk_idx].mmap;
@@ -238,7 +247,7 @@ impl<T: Copy> MmapVecDeque<T> {
     Ok(())
   }
 
-  fn read_element(&self, index: u64) -> Result<T> {
+  fn read_element(&self, index: u64) -> Result<T, MmapVecDequeError> {
     let (chunk_idx, elem_idx) = self.global_to_local(index);
     let chunks = self.chunks.lock();
     let meta = self.meta.lock();
@@ -246,7 +255,7 @@ impl<T: Copy> MmapVecDeque<T> {
     drop(meta);
 
     if chunk_idx >= chunks.len() {
-      bail!("Index out of range");
+      return Err(MmapVecDequeError::IndexOutOfRange);
     }
     let mmap = &chunks[chunk_idx].mmap;
     let ptr = mmap.as_ptr();
@@ -265,27 +274,25 @@ impl<T: Copy> MmapVecDeque<T> {
     self.len() == 0
   }
 
-  pub fn push_back(&mut self, value: T) -> Result<()> {
+  pub fn push_back(&mut self, value: T) -> Result<(), MmapVecDequeError> {
     let mut meta = self.meta.lock();
     let pos = meta.end;
     meta.end += 1;
     drop(meta);
 
-    self.write_element(pos, value)?;
-    Ok(())
+    self.write_element(pos, value)
   }
 
-  pub fn push_front(&mut self, value: T) -> Result<()> {
+  pub fn push_front(&mut self, value: T) -> Result<(), MmapVecDequeError> {
     let mut meta = self.meta.lock();
-    meta.start = meta.start - 1;
+    meta.start = meta.start.checked_sub(1).ok_or_else(|| MmapVecDequeError::Other("Start index underflow".to_string()))?;
     let pos = meta.start;
     drop(meta);
 
-    self.write_element(pos, value)?;
-    Ok(())
+    self.write_element(pos, value)
   }
 
-  pub fn pop_back(&mut self) -> Result<Option<T>> {
+  pub fn pop_back(&mut self) -> Result<Option<T>, MmapVecDequeError> {
     let mut meta = self.meta.lock();
     if meta.start == meta.end {
       return Ok(None);
@@ -298,27 +305,27 @@ impl<T: Copy> MmapVecDeque<T> {
     Ok(Some(val))
   }
 
-  pub fn pop_front(&mut self) -> Result<Option<T>> {
+  pub fn pop_front(&mut self) -> Result<Option<T>, MmapVecDequeError> {
     let mut meta = self.meta.lock();
     if meta.start == meta.end {
       return Ok(None);
     }
     let pos = meta.start;
-    meta.start = pos + 1;
+    meta.start = pos.checked_add(1).ok_or_else(|| MmapVecDequeError::Other("Start index overflow".to_string()))?;
     drop(meta);
 
     let val = self.read_element(pos)?;
     Ok(Some(val))
   }
 
-  pub fn front(&self) -> Option<&T> {
+  pub fn front(&self) -> Option<T> where T: Clone {
     if self.is_empty() {
       return None;
     }
     self.get(0)
   }
 
-  pub fn back(&self) -> Option<&T> {
+  pub fn back(&self) -> Option<T> where T: Clone {
     let l = self.len();
     if l == 0 {
       return None;
@@ -326,60 +333,52 @@ impl<T: Copy> MmapVecDeque<T> {
     self.get(l - 1)
   }
 
-  pub fn clear(&mut self) -> Result<()> {
+  pub fn clear(&mut self) -> Result<(), MmapVecDequeError> {
     let mut meta = self.meta.lock();
     meta.start = LARGE_OFFSET;
     meta.end = LARGE_OFFSET;
     drop(meta);
+    *self.dirty.lock() = true;
     Ok(())
   }
 
-  pub fn get(&self, index: usize) -> Option<&T> {
+  pub fn get(&self, index: usize) -> Option<T> where T: Clone {
     let meta = self.meta.lock();
     if index >= meta.len() {
       return None;
     }
     let global_idx = meta.start + index as u64;
-    let element_size = meta.element_size;
     drop(meta);
 
-    let (chunk_idx, elem_idx) = self.global_to_local(global_idx);
-    let chunks = self.chunks.lock();
-    if chunk_idx >= chunks.len() {
-      return None;
-    }
-    let mmap = &chunks[chunk_idx].mmap;
-    let ptr = mmap.as_ptr();
-    unsafe {
-      let elem_ptr = ptr.add(elem_idx * element_size) as *const T;
-      Some(&*elem_ptr)
+    match self.read_element(global_idx) {
+      Ok(val) => Some(val),
+      Err(_) => None,
     }
   }
 
-  pub fn get_mut(&mut self, index: usize) -> Option<&mut T> {
+  pub fn get_mut(&mut self, index: usize) -> Result<Option<T>, MmapVecDequeError> where T: Clone {
     let meta = self.meta.lock();
     if index >= meta.len() {
-      return None;
+      return Ok(None);
     }
     let global_idx = meta.start + index as u64;
-    let element_size = meta.element_size;
     drop(meta);
 
-    let (chunk_idx, elem_idx) = self.global_to_local(global_idx);
     let mut chunks = self.chunks.lock();
+    let (chunk_idx, elem_idx) = self.global_to_local(global_idx);
     if chunk_idx >= chunks.len() {
-      return None;
+      return Err(MmapVecDequeError::IndexOutOfRange);
     }
     let mmap = &mut chunks[chunk_idx].mmap;
     let ptr = mmap.as_mut_ptr();
     unsafe {
-      let elem_ptr = ptr.add(elem_idx * element_size) as *mut T;
-      *self.dirty.lock() = true;
-      Some(&mut *elem_ptr)
+      let elem_ptr = ptr.add(elem_idx * size_of::<T>()) as *mut T;
+      let value = ptr::read(elem_ptr);
+      Ok(Some(value))
     }
   }
 
-  pub fn commit(&self) -> Result<()> {
+  pub fn commit(&self) -> Result<(), MmapVecDequeError> {
     if *self.dirty.lock() {
       self.flush_all_chunks()?;
       *self.dirty.lock() = false;
@@ -393,7 +392,7 @@ impl<T: Copy> MmapVecDeque<T> {
     Ok(())
   }
 
-  fn maybe_shrink_chunks(&self) -> Result<()> {
+  fn maybe_shrink_chunks(&self) -> Result<(), MmapVecDequeError> {
     let meta = self.meta.lock();
     let chunk_size = meta.chunk_size as u64;
     let start_chunk = meta.start / chunk_size;
@@ -468,7 +467,6 @@ impl<T: Copy> MmapVecDeque<T> {
 
   pub fn iter_mut(&mut self) -> IterMut<'_, T> {
     let len = self.len();
-    let mut pointers = Vec::with_capacity(len);
 
     let meta = self.meta.lock();
     let start = meta.start;
@@ -477,23 +475,27 @@ impl<T: Copy> MmapVecDeque<T> {
     drop(meta);
 
     let base = *self.base_chunk.lock();
-    let mut chunks = self.chunks.lock();
+    // Lock chunks for the entire iteration.
+    // The guard is stored in the iterator to keep it alive.
+    let mut chunks_guard = self.chunks.lock();
+
+    let mut pointers = Vec::with_capacity(len);
     for i in 0..len {
       let global_idx = start + i as u64;
       let chunk_idx = ((global_idx / chunk_size) - base) as usize;
       let elem_idx = (global_idx % chunk_size) as usize;
-      let mmap = &mut chunks[chunk_idx].mmap;
+      let mmap = &mut chunks_guard[chunk_idx].mmap;
       let ptr = mmap.as_mut_ptr();
       let elem_ptr = unsafe { ptr.add(elem_idx * element_size) as *mut T };
       pointers.push(elem_ptr);
     }
-    drop(chunks);
 
     IterMut {
       pointers,
       index: 0,
       len,
-      _marker: PhantomData
+      _marker: PhantomData,
+      _chunks_guard: chunks_guard,
     }
   }
 }
@@ -506,12 +508,13 @@ pub struct Iter<'a, T: Copy> {
 }
 
 impl<'a, T: Copy> Iterator for Iter<'a, T> {
-  type Item = &'a T;
+  type Item = T;
+
   fn next(&mut self) -> Option<Self::Item> {
     if self.index < self.len {
       let ptr = self.pointers[self.index];
       self.index += 1;
-      unsafe { Some(&*ptr) }
+      unsafe { Some(*ptr) }
     } else {
       None
     }
@@ -525,10 +528,13 @@ pub struct IterMut<'a, T: Copy> {
   index: usize,
   len: usize,
   _marker: PhantomData<&'a mut T>,
+  // Keep the chunks guard so memory remains valid and locked.
+  _chunks_guard: parking_lot::MutexGuard<'a, Vec<Chunk>>,
 }
 
 impl<'a, T: Copy> Iterator for IterMut<'a, T> {
   type Item = &'a mut T;
+
   fn next(&mut self) -> Option<Self::Item> {
     if self.index < self.len {
       let ptr = self.pointers[self.index];

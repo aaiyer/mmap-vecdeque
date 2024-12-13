@@ -1,6 +1,6 @@
 [package]
 name = "mmap-vecdeque"
-version = "0.1.0"
+version = "0.2.0"
 authors = ["Anand Aiyer <aaiyer@gmail.com>"]
 edition = "2021"
 description = "A file-backed memory-mapped VecDeque with deferred commits, atomic and durable persistence."
@@ -16,7 +16,7 @@ serde = { version = "1", features = ["derive"] }
 postcard = { version = "1.1", features = ["use-std"] }
 memmap2 = "0.9"
 atomicwrites = "0.4"
-libc = "0.2.168"
+thiserror = "2.0"
 
 [dev-dependencies]
 tempfile = "3.14"
