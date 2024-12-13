@@ -119,3 +119,97 @@ fn test_clear_then_reuse() -> Result<(), MmapVecDequeError> {
 
   Ok(())
 }
+
+#[test]
+fn test_multiple_reopen_cycles() -> Result<(), MmapVecDequeError> {
+  let tmp = TempDir::new()?;
+  let path = tmp.path();
+
+  // First cycle: create and populate
+  {
+    let mut dq = MmapVecDeque::<u64>::open_or_create(path, None)?;
+    // Insert values 0..50
+    for i in 0..50 {
+      dq.push_back(i)?;
+    }
+    dq.commit()?;
+  }
+
+  // Reopen and check
+  {
+    let dq = MmapVecDeque::<u64>::open_or_create(path, None)?;
+    assert_eq!(dq.len(), 50);
+    let collected: Vec<u64> = dq.iter().collect();
+    assert_eq!(collected, (0..50).collect::<Vec<_>>());
+  }
+
+  // Second cycle: modify the existing deque
+  {
+    let mut dq = MmapVecDeque::<u64>::open_or_create(path, None)?;
+    // Pop 10 from front
+    for _ in 0..10 {
+      dq.pop_front()?;
+    }
+    // Now deque should have 40 elements: 10..49
+    dq.commit()?;
+  }
+
+  // Reopen and verify changes
+  {
+    let dq = MmapVecDeque::<u64>::open_or_create(path, None)?;
+    assert_eq!(dq.len(), 40);
+    let collected: Vec<u64> = dq.iter().collect();
+    assert_eq!(collected, (10..50).collect::<Vec<_>>());
+  }
+
+  // Third cycle: add more at the front
+  {
+    let mut dq = MmapVecDeque::<u64>::open_or_create(path, None)?;
+    // Push_front values 100..110
+    for i in 100..110 {
+      dq.push_front(i)?;
+    }
+    dq.commit()?;
+  }
+
+  // Reopen and verify again
+  {
+    let dq = MmapVecDeque::<u64>::open_or_create(path, None)?;
+    assert_eq!(dq.len(), 50);
+    let collected: Vec<u64> = dq.iter().collect();
+
+    // Expected: front now has [109,108,...,100] + [10..49]
+    let mut expected = (100..110).rev().collect::<Vec<u64>>();
+    expected.extend(10..50);
+    assert_eq!(collected, expected);
+  }
+
+  // Fourth cycle: clear and reuse
+  {
+    let mut dq = MmapVecDeque::<u64>::open_or_create(path, None)?;
+    dq.clear()?;
+    dq.commit()?;
+  }
+
+  // Reopen and ensure empty
+  {
+    let mut dq = MmapVecDeque::<u64>::open_or_create(path, None)?;
+    assert_eq!(dq.len(), 0);
+
+    // Add some different numbers
+    for i in 1000..1020 {
+      dq.push_back(i).unwrap();
+    }
+    dq.commit()?;
+  }
+
+  // Final check
+  {
+    let dq = MmapVecDeque::<u64>::open_or_create(path, None)?;
+    assert_eq!(dq.len(), 20);
+    let collected: Vec<u64> = dq.iter().collect();
+    assert_eq!(collected, (1000..1020).collect::<Vec<_>>());
+  }
+
+  Ok(())
+}
